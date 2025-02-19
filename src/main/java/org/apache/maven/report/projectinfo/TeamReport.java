@@ -20,8 +20,8 @@ package org.apache.maven.report.projectinfo;
 
 import javax.inject.Inject;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -36,6 +36,7 @@ import org.apache.maven.model.Model;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.ProjectBuilder;
+import org.apache.maven.report.projectinfo.avatars.AvatarsProvider;
 import org.apache.maven.reporting.MavenReportException;
 import org.apache.maven.repository.RepositorySystem;
 import org.codehaus.plexus.i18n.I18N;
@@ -52,19 +53,51 @@ public class TeamReport extends AbstractProjectInfoReport {
     /**
      * Shows avatar images for team members that have a) properties/picUrl set b) An avatar at gravatar.com for their
      * email address
-     * <p/>
-     * Future versions of this plugin may implement different strategies for resolving avatar images, possibly
-     * using different providers.
-     *<p>
-     *<strong>Note</strong>: This property will be renamed to {@code tteam.showAvatarImages} in 3.0.
+     *
      * @since 2.6
      */
     @Parameter(property = "teamlist.showAvatarImages", defaultValue = "true")
     private boolean showAvatarImages;
 
+    /**
+     * Indicate if URL should be used for avatar images.
+     * <p>
+     * If set to <code>false</code> images will be downloaded and attached to report during build.
+     * Local path will be used for images.
+     *
+     * @since 3.9.0
+     */
+    @Parameter(property = "teamlist.externalAvatarImages", defaultValue = "true")
+    private boolean externalAvatarImages;
+
+    /**
+     * Base URL for avatar provider.
+     *
+     * @since 3.9.0
+     */
+    @Parameter(property = "teamlist.avatarBaseUrl", defaultValue = "https://www.gravatar.com/avatar/")
+    private String avatarBaseUrl;
+
+    /**
+     * Provider name for avatar images.
+     * <p>
+     * Report has one implementation for gravatar.com. Users can provide other by implementing {@link AvatarsProvider}.
+     *
+     * @since 3.9.0
+     */
+    @Parameter(property = "teamlist.avatarProviderName", defaultValue = "gravatar")
+    private String avatarProviderName;
+
+    private final Map<String, AvatarsProvider> avatarsProviders;
+
     @Inject
-    public TeamReport(RepositorySystem repositorySystem, I18N i18n, ProjectBuilder projectBuilder) {
+    public TeamReport(
+            RepositorySystem repositorySystem,
+            I18N i18n,
+            ProjectBuilder projectBuilder,
+            Map<String, AvatarsProvider> avatarsProviders) {
         super(repositorySystem, i18n, projectBuilder);
+        this.avatarsProviders = avatarsProviders;
     }
 
     // ----------------------------------------------------------------------
@@ -83,10 +116,23 @@ public class TeamReport extends AbstractProjectInfoReport {
     }
 
     @Override
-    public void executeReport(Locale locale) {
-        ProjectTeamRenderer r =
-                new ProjectTeamRenderer(getSink(), project.getModel(), getI18N(locale), locale, showAvatarImages);
-        r.render();
+    public void executeReport(Locale locale) throws MavenReportException {
+        AvatarsProvider avatarsProvider = avatarsProviders.get(avatarProviderName);
+        if (avatarsProvider == null) {
+            throw new MavenReportException("No AvatarsProvider found for name " + avatarProviderName);
+        }
+        avatarsProvider.setBaseUrl(avatarBaseUrl);
+        avatarsProvider.setOutputDirectory(getReportOutputDirectory());
+
+        ProjectTeamRenderer renderer = new ProjectTeamRenderer(
+                getSink(),
+                project.getModel(),
+                getI18N(locale),
+                locale,
+                showAvatarImages,
+                externalAvatarImages,
+                avatarsProvider);
+        renderer.render();
     }
 
     /**
@@ -134,20 +180,24 @@ public class TeamReport extends AbstractProjectInfoReport {
 
         private final boolean showAvatarImages;
 
-        private final String protocol;
+        private final boolean externalAvatarImages;
 
-        ProjectTeamRenderer(Sink sink, Model model, I18N i18n, Locale locale, boolean showAvatarImages) {
+        private final AvatarsProvider avatarsProvider;
+
+        ProjectTeamRenderer(
+                Sink sink,
+                Model model,
+                I18N i18n,
+                Locale locale,
+                boolean showAvatarImages,
+                boolean externalAvatarImages,
+                AvatarsProvider avatarsProvider) {
             super(sink, i18n, locale);
 
             this.model = model;
             this.showAvatarImages = showAvatarImages;
-
-            // prepare protocol for gravatar
-            if (model.getUrl() != null && model.getUrl().startsWith("https://")) {
-                this.protocol = "https";
-            } else {
-                this.protocol = "http";
-            }
+            this.externalAvatarImages = externalAvatarImages;
+            this.avatarsProvider = avatarsProvider;
         }
 
         @Override
@@ -226,10 +276,7 @@ public class TeamReport extends AbstractProjectInfoReport {
                 Properties properties = member.getProperties();
                 String picUrl = properties.getProperty("picUrl");
                 if (picUrl == null || picUrl.isEmpty()) {
-                    picUrl = getGravatarUrl(member.getEmail());
-                }
-                if (picUrl == null || picUrl.isEmpty()) {
-                    picUrl = getSpacerGravatarUrl();
+                    picUrl = getExternalAvatarUrl(member.getEmail());
                 }
                 sink.tableCell();
                 sink.figure();
@@ -288,32 +335,13 @@ public class TeamReport extends AbstractProjectInfoReport {
             sink.tableRow_();
         }
 
-        private static final String AVATAR_SIZE = "s=60";
-
-        private String getSpacerGravatarUrl() {
-            return protocol + "://www.gravatar.com/avatar/00000000000000000000000000000000?d=blank&f=y&" + AVATAR_SIZE;
-        }
-
-        private String getGravatarUrl(String email) {
-            if (email == null) {
-                return null;
-            }
-            email = StringUtils.trim(email);
-            email = email.toLowerCase();
-            MessageDigest md;
+        private String getExternalAvatarUrl(String email) {
             try {
-                md = MessageDigest.getInstance("MD5");
-                md.update(email.getBytes());
-                byte[] byteData = md.digest();
-                StringBuilder sb = new StringBuilder();
-                final int lowerEightBitsOnly = 0xff;
-                for (byte aByteData : byteData) {
-                    sb.append(Integer.toString((aByteData & lowerEightBitsOnly) + 0x100, 16)
-                            .substring(1));
-                }
-                return protocol + "://www.gravatar.com/avatar/" + sb.toString() + "?d=mm&" + AVATAR_SIZE;
-            } catch (NoSuchAlgorithmException e) {
-                return null;
+                return externalAvatarImages
+                        ? avatarsProvider.getExternalAvatarUrl(email)
+                        : avatarsProvider.getLocalAvatarPath(email);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
             }
         }
 
